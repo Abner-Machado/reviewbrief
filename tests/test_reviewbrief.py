@@ -213,5 +213,91 @@ class TestCliFailurePaths(unittest.TestCase):
             os.unlink(path)
 
 
+
+BS = chr(92)
+
+
+class TestCombinedDiff(unittest.TestCase):
+    """A merge diff carries one column per parent. Guessing would produce
+    confident, wrong line numbers, so the parser refuses instead."""
+
+    MERGE = "diff --cc src/a.py\n@@@ -1,2 -1,2 +1,3 @@@\n  ctx\n++x = 1\n"
+
+    def test_parse_raises(self):
+        with self.assertRaises(rb.CombinedDiff):
+            rb.parse_diff(self.MERGE)
+
+    def test_cli_exits_1_and_names_the_cause(self):
+        r = subprocess.run([sys.executable, "-I", CLI], input=self.MERGE,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("combined (merge) diff", r.stderr)
+        self.assertIn("HEAD^1", r.stderr)
+
+    def test_plain_diff_still_parses(self):
+        self.assertEqual(len(rb.parse_diff(SAMPLE)), 2)
+
+
+class TestHeaderPaths(unittest.TestCase):
+    @staticmethod
+    def header(h):
+        return rb.parse_diff(h + "\n--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n x\n+y\n")[0]
+
+    def test_plain_path(self):
+        self.assertEqual(self.header("diff --git a/src/app.py b/src/app.py").path,
+                         "src/app.py")
+
+    def test_path_with_a_space(self):
+        f = self.header("diff --git a/my file.py b/my file.py")
+        self.assertEqual(f.path, "my file.py")
+        self.assertEqual(f.language, "python")
+
+    def test_quoted_path_with_an_accent(self):
+        """Git quotes a non-ASCII path and keeps the prefix inside the quotes."""
+        esc = BS + "303" + BS + "251"
+        f = self.header('diff --git "a/caf%s.py" "b/caf%s.py"' % (esc, esc))
+        self.assertEqual(f.path, "caf" + chr(233) + ".py")
+        self.assertEqual(f.language, "python")
+
+    def test_rename_target_wins(self):
+        self.assertEqual(self.header("diff --git a/old/name.py b/new/name.py").path,
+                         "new/name.py")
+
+    def test_directory_named_b_does_not_confuse_it(self):
+        self.assertEqual(self.header("diff --git a/src/b/x.py b/src/b/x.py").path,
+                         "src/b/x.py")
+
+    def test_unquote_strips_the_prefix_only_once(self):
+        self.assertEqual(rb.unquote_path("b/b/thing.py"), "b/thing.py")
+
+
+class TestUntestedPairing(unittest.TestCase):
+    @staticmethod
+    def build(paths):
+        out = ""
+        for p in paths:
+            out += ("diff --git a/%s b/%s\n--- a/x\n+++ b/x\n"
+                    "@@ -1,1 +1,2 @@\n x\n+y\n" % (p, p))
+        return rb.parse_diff(out)
+
+    def test_unrelated_test_does_not_silence_the_diff(self):
+        """The old all-or-nothing rule let one stray test hide every source file."""
+        files = self.build(["src/m0.py", "src/m1.py", "tests/test_other.py"])
+        self.assertEqual(rb.untested(files), ["src/m0.py", "src/m1.py"])
+
+    def test_related_test_silences_only_its_pair(self):
+        files = self.build(["src/app.py", "src/other.py", "tests/test_app.py"])
+        self.assertEqual(rb.untested(files), ["src/other.py"])
+
+    def test_other_naming_conventions_pair_too(self):
+        for src, test in [("src/app.ts", "src/app.test.ts"),
+                          ("lib/user.rb", "spec/user_spec.rb"),
+                          ("main/Cart.java", "test/CartTest.java")]:
+            self.assertEqual(rb.untested(self.build([src, test])), [], (src, test))
+
+    def test_non_source_files_are_never_flagged(self):
+        self.assertEqual(rb.untested(self.build(["README.md", "a.yml"])), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

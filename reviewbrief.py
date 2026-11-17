@@ -22,6 +22,8 @@ from dataclasses import dataclass, field, asdict
 
 __version__ = "0.1.0"
 
+BACKSLASH = chr(92)
+
 # ---------------------------------------------------------------- languages
 
 EXT_LANG = {
@@ -48,14 +50,31 @@ def language_of(path: str) -> str:
     return "unknown"
 
 
+JVM_TEST_RE = re.compile(
+    r"(?:^|/)(?:Test[A-Z0-9]\w*|\w+(?:Test|Tests|Spec|IT))\.(?:java|kt|kts|scala|cs)$")
+
+TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__", "testing"}
+
+
 def looks_like_test(path: str) -> bool:
-    p = path.lower().replace("\\", "/")
-    name = p.rsplit("/", 1)[-1]
+    """Does this path look like a test file, by the conventions people use?
+
+    The leading slash matters: without it a top-level `test/` directory fails a
+    naive `"/test/" in path` check, which is how `test/CartTest.java` once got
+    through as production code.
+    """
+    p = "/" + path.replace(BACKSLASH, "/").lstrip("/")
+    lowered = p.lower()
+    name = lowered.rsplit("/", 1)[-1]
+
+    if any("/" + d + "/" in lowered for d in TEST_DIRS):
+        return True
+    if JVM_TEST_RE.search(p):
+        return True
     return (
-        "/test/" in p or "/tests/" in p or "/spec/" in p or "__tests__" in p
-        or name.startswith("test_") or name.startswith("test.")
+        name.startswith("test_") or name.startswith("test.")
         or "_test." in name or ".test." in name or ".spec." in name
-        or name.endswith("_spec.rb")
+        or "_spec." in name or name.endswith("_test.go")
     )
 
 
@@ -134,21 +153,114 @@ class FileChange:
 
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@(.*)$")
+COMBINED_RE = re.compile(r"^diff --(?:cc|combined) ")
+
+
+class CombinedDiff(Exception):
+    """A merge diff. Its hunk headers carry one column per parent, so the
+    single-parent line arithmetic here does not apply and would lie."""
+
+
+def unquote_path(token: str) -> str:
+    """Strip git's quoting and the a/ or b/ prefix from one path token.
+
+    Git quotes a path that holds a space, a quote or a non-ASCII byte, and the
+    quoted form keeps the prefix inside the quotes: "b/cafÃ©.py".
+    """
+    token = token.strip()
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        inner = token[1:-1]
+        try:
+            token = inner.encode("latin-1", "backslashreplace").decode("unicode_escape")
+            token = token.encode("latin-1", "replace").decode("utf-8", "replace")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            token = inner
+    if token.startswith("a/") or token.startswith("b/"):
+        token = token[2:]
+    return token
+
+
+def split_header_tokens(rest: str) -> list:
+    """Split the two path tokens of a diff header, honoring git quoting.
+
+    Written as a scanner instead of a regular expression: the pattern needs
+    escaped backslashes inside an escaped string, and that is exactly the kind
+    of line that breaks silently when somebody edits it later.
+    """
+    tokens: list = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        while i < n and rest[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        if rest[i] == '"':
+            j = i + 1
+            while j < n:
+                if rest[j] == BACKSLASH:
+                    j += 2
+                    continue
+                if rest[j] == '"':
+                    break
+                j += 1
+            tokens.append(rest[i:min(j + 1, n)])
+            i = j + 1
+        else:
+            j = rest.find(" ", i)
+            if j == -1:
+                tokens.append(rest[i:])
+                break
+            tokens.append(rest[i:j])
+            i = j
+    return tokens
+
+
+def path_from_header(raw: str) -> str:
+    """Pull the destination path out of a 'diff --git a/x b/x' header.
+
+    The unquoted form is ambiguous because a path may contain spaces, so the
+    halves are compared first: git writes the same path twice unless the file
+    was renamed.
+    """
+    rest = raw[len("diff --git "):].strip()
+
+    if rest.startswith('"'):
+        tokens = split_header_tokens(rest)
+        if len(tokens) >= 2:
+            return unquote_path(tokens[-1])
+        if tokens:
+            return unquote_path(tokens[0])
+
+    half = len(rest) // 2
+    if rest[:half].strip() == rest[half:].strip():
+        return unquote_path(rest[half:])
+
+    idx = rest.find(" b/")
+    if idx != -1:
+        return unquote_path(rest[idx + 1:])
+    return unquote_path(rest.split()[-1])
 
 
 def parse_diff(text: str) -> list:
-    """Parse a unified diff. Returns FileChange objects with real line numbers."""
+    """Parse a unified diff. Returns FileChange objects with real line numbers.
+
+    Raises CombinedDiff when handed a merge diff, because the arithmetic here
+    assumes one parent and would produce confident, wrong line numbers.
+    """
     files: list = []
     current: FileChange | None = None
     hunk: Hunk | None = None
     new_lineno = 0
 
     for raw in text.splitlines():
+        if COMBINED_RE.match(raw):
+            raise CombinedDiff(raw.split()[-1])
+
         if raw.startswith("diff --git "):
             current = None
             hunk = None
-            parts = raw.split(" b/", 1)
-            path = parts[1].strip() if len(parts) == 2 else raw.split()[-1].lstrip("b/")
+            path = path_from_header(raw)
             current = FileChange(path=path, language=language_of(path),
                                  is_test=looks_like_test(path))
             files.append(current)
@@ -167,7 +279,7 @@ def parse_diff(text: str) -> list:
             current.is_binary = True
             continue
         if raw.startswith("rename to "):
-            current.path = raw[len("rename to "):].strip()
+            current.path = unquote_path(raw[len("rename to "):])
             current.language = language_of(current.path)
             current.is_test = looks_like_test(current.path)
             continue
@@ -198,11 +310,24 @@ def parse_diff(text: str) -> list:
 
 
 def untested(files: list) -> list:
-    """Source files that changed while no test file changed alongside them."""
-    if any(f.is_test for f in files):
-        return []
-    return [f.path for f in files
-            if f.language in SOURCE_LANGS and not f.is_binary and not f.is_deleted]
+    """Source files that changed with no plausibly related test file in the diff.
+
+    A changed test counts for a source file when the source file's stem appears
+    somewhere in the test's path, which is what every common convention does:
+    test_app.py, app.test.ts, AppTest.java, app_spec.rb. One unrelated test file
+    no longer silences the whole diff.
+    """
+    test_paths = [f.path.lower().replace("\\", "/") for f in files if f.is_test]
+    out = []
+    for f in files:
+        if f.is_test or f.is_binary or f.is_deleted or f.language not in SOURCE_LANGS:
+            continue
+        name = f.path.replace("\\", "/").rsplit("/", 1)[-1]
+        stem = name.rsplit(".", 1)[0].lower()
+        if stem and any(stem in p for p in test_paths):
+            continue
+        out.append(f.path)
+    return out
 
 
 def summarize(files: list) -> dict:
@@ -275,7 +400,7 @@ def render_markdown(files: list, policy: bool = True) -> str:
         pairs = ", ".join(f"{k} x{v}" for k, v in sorted(s["signals"].items()))
         out.append(f"- Signals to confirm: {pairs}")
     if s["source_files_without_test_changes"]:
-        out.append("- No test file changed in this diff. Source files touched: "
+        out.append("- Changed with no matching test file in this diff: "
                    + ", ".join(s["source_files_without_test_changes"]))
     out.append("")
 
@@ -362,7 +487,15 @@ def main(argv=None) -> int:
         print("reviewbrief: the diff is empty, nothing to review.", file=sys.stderr)
         return 1
 
-    files = parse_diff(text)
+    try:
+        files = parse_diff(text)
+    except CombinedDiff as exc:
+        print("reviewbrief: this is a combined (merge) diff, seen at "
+              f"'{exc}'. Its hunk headers carry one column per parent, so the "
+              "line numbers here would be wrong. Review the merge against one "
+              "parent instead, for example: git diff HEAD^1 HEAD",
+              file=sys.stderr)
+        return 1
     if not files:
         print("reviewbrief: no 'diff --git' header found. "
               "This does not look like a git unified diff.", file=sys.stderr)

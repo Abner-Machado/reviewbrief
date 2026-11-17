@@ -1,3 +1,5 @@
+<img src="assets/banner.png" alt="reviewbrief: line numbers that exist" width="880">
+
 # reviewbrief
 
 Build the brief a code reviewer actually needs, with line numbers that exist.
@@ -41,7 +43,7 @@ file cannot be read.
 - Lines added: 5, removed: 1
 - Languages: python, markdown
 - Signals to confirm: debug-leftover x1, secret-like x1
-- No test file changed in this diff. Source files touched: src/app.py
+- Changed with no matching test file in this diff: src/app.py
 
 ### src/app.py
 Language: python. +4 / -1
@@ -69,6 +71,22 @@ it when the line is fine. The value is in where they point, not in what they cla
 The SQL concatenation on line 12 above carries no signal, and it is the worst line in
 the sample. That is the honest shape of this: the tool prepares, the reviewer decides.
 
+## What it does not do
+
+Merge diffs. `git show` on a merge and `git diff --cc` emit one column per parent, so
+the arithmetic above does not apply. Rather than produce numbers that look right, the
+tool says what it saw and exits `1`, pointing you at `git diff HEAD^1 HEAD`.
+
+Any judgment. It prepares; it does not decide.
+
+## The test pairing is a heuristic
+
+A changed test counts for a source file when the source file's stem appears in the test
+path, which covers `test_app.py`, `app.test.ts`, `CartTest.java` and `user_spec.rb`. It
+will miss a test that covers a file without naming it, and it has no idea whether the
+test is any good. It is a prompt for one sentence from the reviewer, not a coverage
+number.
+
 ## Why the line numbers are the hard part
 
 A diff hunk header says `@@ -10,6 +10,9 @@`, and from there the new-file line number
@@ -83,7 +101,7 @@ hunks in one file, and `\ No newline at end of file`.
 python tests/test_reviewbrief.py
 ```
 
-28 tests. Seven of them run the command line and assert on exit codes and the error
+41 tests. Ten of them run the command line and assert on exit codes and the error
 message, because a suite that only walks the happy path is measuring the author's
 imagination.
 
@@ -91,6 +109,15 @@ imagination.
 
 `SKILL.md` is written for an agent that reads skill files. It tells the agent to run the
 tool first and review from its output, instead of eyeballing the diff.
+
+## The banner
+
+`assets/banner.png` is drawn by `scripts/make_banner.py`, which needs Pillow. It is the
+only thing here that needs anything, and nothing else imports it.
+
+```bash
+python scripts/make_banner.py assets/banner.png
+```
 
 ## License
 
