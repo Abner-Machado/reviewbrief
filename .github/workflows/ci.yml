@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        run: python tests/test_reviewbrief.py
+
+      - name: It reviews its own diff
+        shell: bash
+        run: |
+          git diff HEAD~1 HEAD > self.patch || git show --format= HEAD > self.patch
+          python reviewbrief.py --diff self.patch > brief.md
+          test -s brief.md
+          grep -q "## Brief" brief.md
+
+      - name: Empty input exits 1
+        shell: bash
+        run: |
+          set +e
+          printf '' | python reviewbrief.py >/dev/null 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 1
+
+      - name: A missing file exits 2
+        shell: bash
+        run: |
+          set +e
+          python reviewbrief.py --diff no-such-file.patch >/dev/null 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 2
