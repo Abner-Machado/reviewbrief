@@ -47,3 +47,16 @@ jobs:
           code=$?
           set -e
           test "$code" -eq 2
+
+  no-dependencies:
+    # The README says standard library only, no install. This is that claim as a check,
+    # with the allowed set read from the interpreter instead of a hand-kept list. The
+    # banner script needs Pillow, is not imported by the tool, and is skipped on purpose.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Every import the tool makes is standard library
+        run: python tools/stdlib_guard.py . --skip scripts
